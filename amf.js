@@ -3,6 +3,9 @@
  * based on Surrey's R-AMF (AMF 99) implementation https://code.google.com/p/r-amf
  * For more information on R-AMF (AMF 99), including Java (Spring) R-AMF server
  * see http://www.reignite.com.au/binary-communication-using-ajax-and-amf
+ * Modified to work with BlazeDS 3.4 by adding  sendMessageId: true, and uncommented the DSId values 
+ * as it seems BlazeDS needs them to setup the Flex Session and return AcknowledgeMessage
+ * instead of DSK (AcknowledgeMessageExt messages) that this can´t process.
  */
 var amf = {
 
@@ -26,27 +29,31 @@ var amf = {
         UINT29_MASK : 536870911,
         INT28_MAX_VALUE : 268435455,
         INT28_MIN_VALUE : -268435456,
-        CLASS_ALIAS : "_explicitType"
+        CLASS_ALIAS : "_explicitType",
+        EXTERNALIZABLE : "_isExternalizable"
     },
     requestTimeout: 30000, //30 seconds
     requestPoolSize: 6,
     requestPool: [],
     messageQueue: [],
-    sendMessageId: false,
+    sendMessageId: true,
     clientId: null,
     sequence: 1,
-    destination: "",
     endpoint: "",
     headers: null,
     doNothing: new Function,
+    classRegistry: {},
 
-    init: function(destination, endpoint, timeout) {
+    init: function(endpoint, timeout) {
         this.clientId = null;
         this.sequence = 1;
-        this.destination = destination;
         this.endpoint = endpoint;
         this.requestTimeout = timeout ? timeout : 30000; //30 seconds
         this.headers = [];
+    },
+
+    registerClass: function(name, clazz) {
+        this.classRegistry[name] = clazz;
     },
 
     addHeader: function(name, value) {
@@ -88,7 +95,7 @@ var amf = {
             destination: "",
             operation: 5,
             //body: [],
-            //headers: {DSId:'nil'},
+            headers: {DSId:'nil'},
             clientId: null
         };
     },
@@ -100,7 +107,7 @@ var amf = {
             source: "",
             operation: "",
             body: [],
-            //headers: {DSId:'nil'},
+            headers: {DSId:'nil'},
             clientId: null
         };
     },
@@ -115,7 +122,7 @@ var amf = {
         }
     },
     
-    createMessage: function(source, operation, params) {
+    createMessage: function(destination, source, operation, params) {
         var actionMessage = new amf.ActionMessage();
         var messageBody = new amf.MessageBody();
         var message;
@@ -123,18 +130,18 @@ var amf = {
             this.sequence = 1;
             messageBody.responseURI = "/" + this.sequence++;
             message = new amf.CommandMessage();
-            message.destination = this.destination;
+            message.destination = destination;
         } else {
             messageBody.responseURI = "/" + this.sequence++;
             message = new amf.RemotingMessage();
-            message.destination = this.destination;
+            message.destination = destination;
             message.source = source;
             message.operation = operation;
             message.body = params;
             if (this.sendMessageId) {
                 message.messageId = amf.uuid(0, 0);
             }
-            //message.headers['DSId'] = this.clientId;
+            message.headers['DSId'] = this.clientId;
             message.clientId = this.clientId;
 
             for (var i = 0; i < this.headers.length; i++) {
@@ -150,12 +157,12 @@ var amf = {
         return actionMessage;
     },
 
-    invoke: function(source, operation, params, onResult, onStatus) {
+    invoke: function(destination, source, operation, params, onResult, onStatus) {
         if (this.clientId == null && this.messageQueue.length == 0) {
-            this.messageQueue.push([this.createMessage("ping"), onResult, onStatus]);
+            this.messageQueue.push([this.createMessage(destination, "ping"), onResult, onStatus]);
             this._processQueue();
         }
-        this.messageQueue.push([this.createMessage(source, operation, params), onResult, onStatus]);
+        this.messageQueue.push([this.createMessage(destination, source, operation, params), onResult, onStatus]);
         if (this.clientId != null) {
             this._processQueue();
         }
@@ -207,7 +214,7 @@ var amf = {
                                         this.parent.clientId = body.data.clientId;
                                         for (var i = 0; i < this.parent.messageQueue.length; i++) {
                                             this.parent.messageQueue[i][0].bodies[0].data[0].clientId = this.parent.clientId;
-                                            //this.parent.messageQueue[i][0].bodies[0].data[0].headers.DSId = this.parent.clientId;
+                                            this.parent.messageQueue[i][0].bodies[0].data[0].headers.DSId = this.parent.clientId;
                                         }
                                     } else {
                                         onResult(body.data.body);
@@ -228,7 +235,7 @@ var amf = {
                         onStatus({faultCode:1, faultDetail:this.responseText, faultString:""});
                     }
                 } catch (e) {
-                    onStatus({faultCode:2, faultDetail:"", faultString:""});
+                    onStatus({faultCode:2, faultDetail:"", faultString:""+e});
                 }
             }
         };
@@ -700,6 +707,7 @@ amf.Reader.prototype.readTraits = function(ref) {
         if (className != null && className != "") {
             traits[amf.CONST.CLASS_ALIAS] = className;
         }
+        traits[amf.CONST.EXTERNALIZABLE] = ((ref & 4) == 4);
         traits.props = [];
         for (var i = 0; i < count; i++) {
             traits.props.push(this.readString());
@@ -717,16 +725,27 @@ amf.Reader.prototype.readScriptObject = function() {
         var traits = this.readTraits(ref);
         var obj = {};
         if (amf.CONST.CLASS_ALIAS in traits) {
+            var clazzName = traits[amf.CONST.CLASS_ALIAS];
+            var contructor = amf.classRegistry[clazzName];
+            if (contructor){
+                obj = new contructor();
+            }
             obj[amf.CONST.CLASS_ALIAS] = traits[amf.CONST.CLASS_ALIAS];
         }
         this.rememberObject(obj);
-        if ((ref & 4) == 4 && obj[amf.CONST.CLASS_ALIAS] == "flex.messaging.io.ArrayCollection") {//externalizable
-            return this.readObject();
+        if (traits[amf.CONST.EXTERNALIZABLE]) {//externalizable
+            if (obj[amf.CONST.CLASS_ALIAS] == "flex.messaging.io.ArrayCollection") {
+            	obj.source = this.readObject();
+            }else if (obj[amf.CONST.CLASS_ALIAS] == "java.lang.Class") {
+                obj.clazz = this.readObject();
+        	}else{
+        		throw "Unsupported external object: " + obj[amf.CONST.CLASS_ALIAS];
+        	}
         } else {
             for (var i in traits.props) {
                 obj[traits.props[i]] = this.readObject();
             }
-            if ((ref & 8) == 8) {//dynamic
+            if ((ref & 11) == 11) {//dynamic
                 for (; ;) {
                     var name = this.readString();
                     if (name == null || name.length == 0) {
